@@ -10,9 +10,11 @@ class Lock(object):
         self.device_controller_ = device_ctrl
 
     def lock(self):
-        result = self.device_controller_.lock()
+        response = self.device_controller_.lock()
         self.state = Locked
+        return response
 
     def unlock(self):
-        result = self.device_controller_.unlock()
+        response = self.device_controller_.unlock()
         self.state = Unlocked
+        return response
