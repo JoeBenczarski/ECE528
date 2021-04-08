@@ -49,6 +49,12 @@ def mqtt_dispatch(topic: str, payload: dict):
         raise NotImplementedError
 
 
+def mqtt_send_state(state: str):
+    topic = "dt/lock/state"
+    payload = json.dumps({"state": state})
+    aws_iot.publish(topic=topic, payload=payload, qos=mqtt.QoS.AT_LEAST_ONCE)
+
+
 # IoT callbacks
 def on_connection_interrupted(connection, error, **kwargs):
     logging.info(f"Connection interrupted. error: {error}")
@@ -104,7 +110,7 @@ def rekognition_thread(pipeline: queue.Queue):
         _, frame_png = cv2.imencode('.png', frame)
         frame_bytes = frame_png.tobytes()
         prob = detector.detect_face_from_bytes(frame_bytes)
-        if prob > 0.90:
+        if prob > 0.95:
             logging.debug(f'Probability: {prob}  Face detected')
             # check if this is an authorized person
             with open('images/Joe-Benczarski.jpg', 'rb') as tgt:
@@ -112,7 +118,10 @@ def rekognition_thread(pipeline: queue.Queue):
                 if auth:
                     logging.info(f"Detected authorized person")
                     # Unlock the door
-                    vir_lock.unlock()
+                    if vir_lock.state is not lock.Unlocked:
+                        lock_resp = vir_lock.unlock()
+                        logging.info(lock_resp)
+                        mqtt_send_state("unlock")
         else:
             logging.debug(f'Probability: {prob}  No face detected')
 
@@ -121,8 +130,8 @@ def rekognition_thread(pipeline: queue.Queue):
 def iot_thread(pipeline: queue.Queue):
     while capturing.is_set():
         info = pipeline.get(block=True)
-        topic = info['topic']
-        payload = json.loads(info['payload'].decode("utf-8"))
+        topic = info["topic"]
+        payload = json.loads(info["payload"].decode("utf-8"))
         logging.debug(f"Dispatching: {topic} : {payload}")
         try:
             mqtt_dispatch(topic, payload)
@@ -131,19 +140,22 @@ def iot_thread(pipeline: queue.Queue):
             logging.warning(f"NotImplementedError: {topic} : {payload}")
 
 
+# Setup AWS IoT Core
+cert_path = os.path.abspath('./certs/5b35693745-certificate.pem.crt')
+key_path = os.path.abspath('./certs/5b35693745-private.pem.key')
+root_ca_path = os.path.abspath('./certs/AmazonRootCA1.pem')
+endpoint = "aeuwkvsf1rv59-ats.iot.us-east-1.amazonaws.com"
+client = "door-lock"
+aws_iot = iot_comm_aws.IotCommAws(client_id=client, endpoint=endpoint,
+                                  cert=cert_path, key=key_path, root_ca=root_ca_path,
+                                  conn_int=on_connection_interrupted, conn_res=on_connection_resumed)
+
+
 if __name__ == "__main__":
     # Setup logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S')
-    # Setup AWS IoT Core
-    cert_path = os.path.abspath('./certs/5b35693745-certificate.pem.crt')
-    key_path = os.path.abspath('./certs/5b35693745-private.pem.key')
-    root_ca_path = os.path.abspath('./certs/AmazonRootCA1.pem')
-    endpoint = "aeuwkvsf1rv59-ats.iot.us-east-1.amazonaws.com"
-    client = "door-lock"
+
     subscribe_topic = "cmd/lock/state"
-    aws_iot = iot_comm_aws.IotCommAws(client_id=client, endpoint=endpoint,
-                                      cert=cert_path, key=key_path, root_ca=root_ca_path,
-                                      conn_int=on_connection_interrupted, conn_res=on_connection_resumed)
     connect_future = aws_iot.connect()
     connect_future.result()
     subscribe_future, packet_id = aws_iot.subscribe(subscribe_topic, mqtt.QoS.AT_LEAST_ONCE, on_message_received)
@@ -152,6 +164,8 @@ if __name__ == "__main__":
     # Setup video feed
     capturing.set()
     logging.info(f'Starting video feed')
+    vir_lock.lock()
+    mqtt_send_state("lock")
     # Start threads
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         executor.submit(video_thread, aws_pipeline)

@@ -6,7 +6,7 @@ Locked = 1
 class Lock(object):
 
     def __init__(self, device_ctrl):
-        self.state = Unlocked
+        self.state = Locked
         self.device_controller_ = device_ctrl
 
     def lock(self):
