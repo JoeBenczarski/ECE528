@@ -28,18 +28,15 @@ vir_lock = lock.Lock(phys_lock)
 def mqtt_dispatch(topic: str, payload: dict):
     topic_levels = topic.split("/")
     if topic_levels[0] == "cmd":
-        logging.debug("Received command")
         # Handle incoming command
         if topic_levels[1] == "lock":
-            logging.debug("..for lock")
             if topic_levels[2] == "state":
-                logging.debug("..for state")
                 if payload["state"] == "lock":
-                    logging.debug("..to lock door")
                     logging.info(vir_lock.lock())
+                    mqtt_send_state("lock")
                 elif payload["state"] == "unlock":
-                    logging.debug("..to unlock door")
                     logging.info(vir_lock.unlock())
+                    mqtt_send_state("unlock")
                 else:
                     raise NotImplementedError
     elif topic_levels[0] == "dt":
@@ -57,7 +54,7 @@ def mqtt_send_state(state: str):
 
 # IoT callbacks
 def on_connection_interrupted(connection, error, **kwargs):
-    logging.info(f"Connection interrupted. error: {error}")
+    logging.info(f"Connection interrupted: {connection} {error}")
 
 
 def on_connection_resumed(connection, return_code, session_present, **kwargs):
@@ -98,11 +95,10 @@ def video_thread(pipeline: queue.Queue):
         elapsed = time.time() - past
         if elapsed > 2:
             past = time.time()
-            if vir_lock.state is lock.Locked:
-                try:
-                    pipeline.put(frame, timeout=2)
-                except queue.Empty:
-                    logging.debug(f"video queue full")
+            try:
+                pipeline.put(frame, timeout=2)
+            except queue.Full:
+                logging.debug(f"video queue full")
         # must call wait key for cv2.imshow to work
         if cv2.waitKey(1) & 0xFF == ord('q'):
             stop_cap_event.set()
@@ -121,20 +117,22 @@ def rekognition_thread(pipeline: queue.Queue):
             frame = pipeline.get(block=True, timeout=2)
             _, frame_png = cv2.imencode('.png', frame)
             frame_bytes = frame_png.tobytes()
-            if vir_lock.state is lock.Locked:
+            if vir_lock.get_state() is lock.Locked:
                 prob = detector.detect_face_from_bytes(frame_bytes)
                 if prob > 0.75:
                     logging.info(f'Probability: {prob}  Face detected')
                     # check if this is an authorized person
-                    with open('images/Joe-Benczarski.jpg', 'rb') as tgt:
-                        auth = detector.compare_face_from_bytes(frame_bytes, tgt.read(), 99.5)
-                        if auth:
-                            logging.info(f"Detected authorized person")
-                            # Unlock the door
-                            if vir_lock.state is not lock.Unlocked:
-                                lock_resp = vir_lock.unlock()
-                                logging.info(lock_resp)
-                                mqtt_send_state("unlock")
+                    try:
+                        with open('images/Joe-Benczarski.jpg', 'rb') as tgt:
+                            compare_bytes = tgt.read()
+                    except OSError:
+                        logging.error(f"cannot open image")
+                    auth = detector.compare_face_from_bytes(frame_bytes, compare_bytes, 99.5)
+                    if auth:
+                        logging.info(f"Detected authorized person")
+                        # Unlock the door
+                        logging.info(vir_lock.unlock())
+                        mqtt_send_state("unlock")
                 else:
                     logging.info(f'Probability: {prob}  No face detected')
         except queue.Empty:
@@ -193,4 +191,3 @@ if __name__ == "__main__":
     # Shutdown AWS IoT Core
     disconnect_future = aws_iot.disconnect()
     disconnect_future.result()
-
