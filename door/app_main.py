@@ -94,7 +94,9 @@ def video_thread(pipeline: queue.Queue):
         cv2.imshow('Video Feed', frame)
         elapsed = time.time() - past
         if elapsed > 2:
-            pipeline.put(frame)
+            past = time.time()
+            if vir_lock.state is lock.Locked:
+                pipeline.put(frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             capturing.clear()
             break
@@ -109,21 +111,22 @@ def rekognition_thread(pipeline: queue.Queue):
         frame = pipeline.get(block=True)
         _, frame_png = cv2.imencode('.png', frame)
         frame_bytes = frame_png.tobytes()
-        prob = detector.detect_face_from_bytes(frame_bytes)
-        if prob > 0.95:
-            logging.debug(f'Probability: {prob}  Face detected')
-            # check if this is an authorized person
-            with open('images/Joe-Benczarski.jpg', 'rb') as tgt:
-                auth = detector.compare_face_from_bytes(frame_bytes, tgt.read(), 99.5)
-                if auth:
-                    logging.info(f"Detected authorized person")
-                    # Unlock the door
-                    if vir_lock.state is not lock.Unlocked:
-                        lock_resp = vir_lock.unlock()
-                        logging.info(lock_resp)
-                        mqtt_send_state("unlock")
-        else:
-            logging.debug(f'Probability: {prob}  No face detected')
+        if vir_lock.state is lock.Locked:
+            prob = detector.detect_face_from_bytes(frame_bytes)
+            if prob > 0.75:
+                logging.info(f'Probability: {prob}  Face detected')
+                # check if this is an authorized person
+                with open('images/Joe-Benczarski.jpg', 'rb') as tgt:
+                    auth = detector.compare_face_from_bytes(frame_bytes, tgt.read(), 99.5)
+                    if auth:
+                        logging.info(f"Detected authorized person")
+                        # Unlock the door
+                        if vir_lock.state is not lock.Unlocked:
+                            lock_resp = vir_lock.unlock()
+                            logging.info(lock_resp)
+                            mqtt_send_state("unlock")
+            else:
+                logging.info(f'Probability: {prob}  No face detected')
 
 
 # Thread for AWS IoT
