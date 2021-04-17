@@ -1,0 +1,11 @@
+///   basic topics / payload   ///
+
+cmd/lock/state
+{
+    "state": "lock/unlock"
+}
+
+dt/lock/state
+{
+    "state": "lock/unlock"
+}

@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 
 
-class IotComm(ABC):
+class IotMqtt(ABC):
 
     @abstractmethod
     def connect(self):
