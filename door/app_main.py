@@ -18,7 +18,7 @@ import lock_physical
 # Globals
 aws_pipeline = queue.Queue()
 iot_pipeline = queue.Queue()
-capturing = threading.Event()
+stop_cap_event = threading.Event()
 
 phys_lock = lock_physical.LockPhysical()
 vir_lock = lock.Lock(phys_lock)
@@ -88,18 +88,24 @@ def video_thread(pipeline: queue.Queue):
     past = time.time()
     video = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not video.isOpened():
-        capturing.clear()
-    while capturing.is_set():
+        stop_cap_event.set()
+    while True:
+        if stop_cap_event.is_set():
+            logging.info(f"vid thread detected stop capture")
+            break
         _, frame = video.read()
         cv2.imshow('Video Feed', frame)
         elapsed = time.time() - past
         if elapsed > 2:
             past = time.time()
             if vir_lock.state is lock.Locked:
-                pipeline.put(frame)
+                try:
+                    pipeline.put(frame, timeout=2)
+                except queue.Empty:
+                    logging.debug(f"video queue full")
+        # must call wait key for cv2.imshow to work
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            capturing.clear()
-            break
+            stop_cap_event.set()
     video.release()
     cv2.destroyAllWindows()
 
@@ -107,40 +113,52 @@ def video_thread(pipeline: queue.Queue):
 # Thread for AWS Rekognition
 def rekognition_thread(pipeline: queue.Queue):
     detector = face_detector.FaceDetector()
-    while capturing.is_set():
-        frame = pipeline.get(block=True)
-        _, frame_png = cv2.imencode('.png', frame)
-        frame_bytes = frame_png.tobytes()
-        if vir_lock.state is lock.Locked:
-            prob = detector.detect_face_from_bytes(frame_bytes)
-            if prob > 0.75:
-                logging.info(f'Probability: {prob}  Face detected')
-                # check if this is an authorized person
-                with open('images/Joe-Benczarski.jpg', 'rb') as tgt:
-                    auth = detector.compare_face_from_bytes(frame_bytes, tgt.read(), 99.5)
-                    if auth:
-                        logging.info(f"Detected authorized person")
-                        # Unlock the door
-                        if vir_lock.state is not lock.Unlocked:
-                            lock_resp = vir_lock.unlock()
-                            logging.info(lock_resp)
-                            mqtt_send_state("unlock")
-            else:
-                logging.info(f'Probability: {prob}  No face detected')
+    while True:
+        if stop_cap_event.is_set():
+            logging.info(f"rekog thread detected stop capture")
+            break
+        try:
+            frame = pipeline.get(block=True, timeout=2)
+            _, frame_png = cv2.imencode('.png', frame)
+            frame_bytes = frame_png.tobytes()
+            if vir_lock.state is lock.Locked:
+                prob = detector.detect_face_from_bytes(frame_bytes)
+                if prob > 0.75:
+                    logging.info(f'Probability: {prob}  Face detected')
+                    # check if this is an authorized person
+                    with open('images/Joe-Benczarski.jpg', 'rb') as tgt:
+                        auth = detector.compare_face_from_bytes(frame_bytes, tgt.read(), 99.5)
+                        if auth:
+                            logging.info(f"Detected authorized person")
+                            # Unlock the door
+                            if vir_lock.state is not lock.Unlocked:
+                                lock_resp = vir_lock.unlock()
+                                logging.info(lock_resp)
+                                mqtt_send_state("unlock")
+                else:
+                    logging.info(f'Probability: {prob}  No face detected')
+        except queue.Empty:
+            logging.debug(f"rekognition queue empty")
 
 
 # Thread for AWS IoT
 def iot_thread(pipeline: queue.Queue):
-    while capturing.is_set():
-        info = pipeline.get(block=True)
-        topic = info["topic"]
-        payload = json.loads(info["payload"].decode("utf-8"))
-        logging.debug(f"Dispatching: {topic} : {payload}")
+    while True:
+        if stop_cap_event.is_set():
+            logging.info(f"iot thread detected stop capture")
+            break
         try:
-            mqtt_dispatch(topic, payload)
-            logging.debug(f"Dispatched: {topic} : {payload}")
-        except NotImplementedError:
-            logging.warning(f"NotImplementedError: {topic} : {payload}")
+            info = pipeline.get(block=True, timeout=2)
+            topic = info["topic"]
+            payload = json.loads(info["payload"].decode("utf-8"))
+            logging.debug(f"Dispatching: {topic} : {payload}")
+            try:
+                mqtt_dispatch(topic, payload)
+                logging.debug(f"Dispatched: {topic} : {payload}")
+            except NotImplementedError:
+                logging.warning(f"NotImplementedError: {topic} : {payload}")
+        except queue.Empty:
+            logging.debug(f"iot queue timeout")
 
 
 # Setup AWS IoT Core
@@ -164,17 +182,15 @@ if __name__ == "__main__":
     subscribe_future, packet_id = aws_iot.subscribe(subscribe_topic, mqtt.QoS.AT_LEAST_ONCE, on_message_received)
     subscribe_result = subscribe_future.result()
     logging.info(f"Subscribed with {str(subscribe_result['qos'])}")
-    # Setup video feed
-    capturing.set()
-    logging.info(f'Starting video feed')
-    vir_lock.lock()
     mqtt_send_state("lock")
     # Start threads
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        logging.info("submitting threads")
         executor.submit(video_thread, aws_pipeline)
         executor.submit(rekognition_thread, aws_pipeline)
         executor.submit(iot_thread, iot_pipeline)
+    logging.info(f'Shutting down')
     # Shutdown AWS IoT Core
     disconnect_future = aws_iot.disconnect()
     disconnect_future.result()
-    logging.info(f'Shutting down')
+
